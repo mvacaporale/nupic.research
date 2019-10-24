@@ -90,49 +90,198 @@ class BaseLogger:
 
 class SparseLogger(BaseLogger):
     def __init__(self, model, config=None):
+        print("SparseLogger.__init__")
         super().__init__(model, config)
         defaults = dict(
             log_magnitude_vs_coactivations=False,  # scatter plot of magn. vs coacts.
             debug_sparse=False,
+            debug_network=False,
             log_sparse_layers_grid=False,
         )
         defaults.update(config or {})
         self.__dict__.update(defaults)
         self.model = model
 
+        if self.debug_network:
+            print(self.model.network)
+
+        print(self.log_magnitude_vs_coactivations)
+        if self.log_magnitude_vs_coactivations:
+            for module in self.model.sparse_modules:
+                print('     init coact tracking for ', module.__class__.__name__)
+                module.init_coactivation_tracking()
+
     def log_metrics(self, loss, acc, train, noise):
         super().log_metrics(loss, acc, train, noise)
         if train and self.debug_sparse:
             self._log_sparse_levels()
+
         if train and self.log_magnitude_vs_coactivations:
-            self._log_magnitude_and_coactivations(train)
+            for module in self.model.sparse_modules:
+                module.reset_coactivations()
 
-    def _log_magnitude_and_coactivations(self, train):
+        if not train and self._log_magnitude_and_coactivations:
+            print('Logging mag and coactivations')
+            self._log_magnitude_and_coactivations()
 
-        for i, module in enumerate(self.model.sparse_modules):
+    def _log_magnitude_and_coactivations(self):
+        print('_log_magnitude_and_coactivations')
+        for module in self.model.sparse_modules:
 
             m = module.m
-            coacts = m.coactivations.clone().detach().to("cpu").numpy()
-            weight = m.weight.clone().detach().to("cpu").numpy()
-            grads = m.weight.grad.clone().detach().to("cpu").numpy()
+            if hasattr(m, "coactivations"):
+                print('     m', m.__class__.__name__)
+                # print('     c', m.coactivations[0:20])
 
-            mask = ((m.weight.grad != 0)).to("cpu").numpy()
+            # coacts = m.coactivations.clone().detach().to("cpu").numpy()
+            # weight = m.weight.clone().detach().to("cpu").numpy()
+            # grads = m.weight.grad.clone().detach().to("cpu").numpy()
 
-            coacts = coacts[mask]
+            # mask = ((m.weight.grad != 0)).to("cpu").numpy()
+
+            # coacts = coacts[mask]
+            # weight = weight[mask]
+            # grads = grads[mask]
+            # grads = np.log(np.abs(grads))
+
+            # x, y, hue = "coactivations", "weight", "log_abs_grads"
+
+            # dataframe = DataFrame(
+            #     {x: coacts.flatten(), y: weight.flatten(), hue: grads.flatten()}
+            # )
+            # seaborn_config = dict(rc={"figure.figsize": (11.7, 8.27)}, style="white")
+
+            # self.log["scatter_mag_vs_coacts_layer-{}".format(str(i))] = dict(
+            #     data=dataframe, x=x, y=y, hue=hue, seaborn_config=seaborn_config
+            # )
+            # import ipdb; ipdb.set_trace()
+            weight = m.weight.clone().detach().cpu()
+            # grads = m.weight.grad.clone().detach().cpu()
+            # mask = ((m.weight.grad != 0) & (m.weight != 0)).cpu()
+            mask = (m.weight != 0).cpu()
+
             weight = weight[mask]
-            grads = grads[mask]
-            grads = np.log(np.abs(grads))
+            # grads = grads[mask]
 
-            x, y, hue = "coactivations", "weight", "log_abs_grads"
+            # direction = torch.sign(weight) == torch.sign(grads)
+            # direction[weight == 0] = grads[weight == 0] > 0
+            # direction = direction.numpy()
+            # direction = [
+            #     "Growing" if d else "Shrinking"
+            #     for d in direction
+            # ]
 
-            dataframe = DataFrame(
-                {x: coacts.flatten(), y: weight.flatten(), hue: grads.flatten()}
+            weight = weight.numpy()
+            # grads = grads.numpy()
+            # grads = np.log(np.abs(grads))
+
+            # grads[grads < -10] = -10
+
+            coact_d = {}
+            coact_types = [
+                "coactivations",
+                "coacts_01",
+                "coacts_10",
+                "coacts_00",
+            ]
+            has_all = True
+            for coact_type in coact_types:
+
+                if not hasattr(m, coact_type):
+                    has_all = False
+                    continue
+
+                coacts = getattr(m, coact_type)
+                coacts = coacts.clone().detach().cpu().numpy()
+                coacts = coacts[mask]
+
+                coact_d[coact_type] = coacts
+
+                # if "all" in coact_d:
+                #     coact_d["all"] = np.vstack([
+                #         coact_d["all"],
+                #         coact_d[coact_type].flatten()
+                #     ])
+                # else:
+                #     coact_d["all"] = coact_d[coact_type].flatten()
+
+            log_name = "mag_vs_coacts_layer-{}".format(module.pos)
+            self.log[log_name] = dict(
+                coacts=DataFrame(coact_d),
+                weights=weight,
             )
-            seaborn_config = dict(rc={"figure.figsize": (11.7, 8.27)}, style="white")
 
-            self.log["scatter_mag_vs_coacts_layer-{}".format(str(i))] = dict(
-                data=dataframe, x=x, y=y, hue=hue, seaborn_config=seaborn_config
-            )
+            # dominant = np.argmax(coact_d["all"], axis=0)
+            # dmap = {
+            #     0: "11_dominant",
+            #     1: "01_dominant",
+            #     2: "10_dominant",
+            #     3: "00_dominant",
+            # }
+            # dominant = [
+            #     dmap[d] for d in dominant
+            # ]
+
+            # for coact_type in coact_types:
+
+            #     if coact_type not in coact_d:
+            #         continue
+
+            #     coacts = coact_d[coact_type]
+
+            #     # x, y, hue = coact_type, "weight", "log_abs_grads"
+            #     x, y = coact_type, "weight"
+
+            #     dataframe = DataFrame({
+            #         x: coacts.flatten(),
+            #         y: weight.flatten(),
+            #         # hue: grads.flatten()
+            #     })
+            #     seaborn_config = dict(
+            #         rc={"figure.figsize": (11.7, 8.27)},
+            #         style="white",
+            #     )
+
+            #     log_name = "seaborn_mag_vs_{}_layer-{}".format(coact_type, module.pos)
+            #     self.log[log_name] = dict(
+            #         data=dataframe,
+            #         x=x,
+            #         y=y,
+            #         # hue=hue,
+            #         # style=direction,
+            #         # style_order=["Growing", "Shrinking"],
+            #         # style=dominant,
+            #         # style_order=
+            #         # ["11_dominant", "01_dominant", "10_dominant", "00_dominant"],
+            #         seaborn_config=seaborn_config,
+            #         seaborn_plottype="scatterplot",
+            #     )
+
+            # if has_all:
+
+            #     # Convert to factions.
+            #     total_coacts = None
+            #     for coact_type in coact_types:
+            #         print(coact_type)
+            #         if total_coacts is None:
+            #             total_coacts = coact_d[coact_type].copy()
+            #         else:
+            #             print('accumulating')
+            #             total_coacts[:] += coact_d[coact_type]
+
+            #     for coact_type in coact_types:
+            #         coact_d[coact_type] = coact_d[coact_type] / total_coacts
+
+            #     coacts = coact_d.pop("coactivations")
+            #     coact_d["coacts_11"] = coacts
+            #     dataframe = DataFrame(coact_d)
+
+            #     log_name = "seaborn_coact_pairs_layer-{}".format(module.pos)
+            #     self.log[log_name] = dict(
+            #         data=dataframe,
+            #         seaborn_config=seaborn_config,
+            #         seaborn_plottype="pairplot",
+            #     )
 
     def _log_sparse_levels(self):
         with torch.no_grad():

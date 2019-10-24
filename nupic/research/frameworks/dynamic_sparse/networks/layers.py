@@ -196,7 +196,7 @@ class DynamicSparseBase(torch.nn.Module):
             # TODO: This assumption of taking the first element may not
             #       work for all module.
             input_tensor = input_tensor[0]
-        if module.training:
+        if not module.training:
             if module.learning_iterations % module.update_interval == 0:
                 module._update_coactivations(input_tensor, output_tensor)
             module.learning_iterations += 1
@@ -224,10 +224,16 @@ class DSLinear(torch.nn.Linear, DynamicSparseBase):
         defaults = dict(
             use_binary_coactivations=True,
             lin_update_interval=1,
+            track_coactivation_variants=False,  # 0/0, 0/1, 1/0 variants - not just 1/1
         )
         new_defaults = {k: (config.get(k, None) or v) for k, v in defaults.items()}
         self.__dict__.update(new_defaults)
         self.update_interval = self.lin_update_interval
+
+        if self.track_coactivation_variants:
+            self.register_buffer("coacts_01", torch.zeros_like(weight))
+            self.register_buffer("coacts_10", torch.zeros_like(weight))
+            self.register_buffer("coacts_00", torch.zeros_like(weight))
 
     def calc_coactivations(self, x, y):
         outer = 0
@@ -247,8 +253,47 @@ class DSLinear(torch.nn.Linear, DynamicSparseBase):
             for s in range(n_samples):
                 outer += torch.ger(curr_act[s], prev_act[s])
 
+            if self.track_coactivation_variants:
+
+                # -------
+                # C01
+                # -------
+                prev_act = (x <= 0).detach().float()
+                curr_act = (y > 0).detach().float()
+
+                # Cumulate outer product over all samples.
+                for s in range(n_samples):
+                    self.coacts_01[:] += torch.ger(curr_act[s], prev_act[s])
+
+                # -------
+                # C10
+                # -------
+                prev_act = (x > 0).detach().float()
+                curr_act = (y <= 0).detach().float()
+
+                # Cumulate outer product over all samples.
+                for s in range(n_samples):
+                    self.coacts_10[:] += torch.ger(curr_act[s], prev_act[s])
+
+                # -------
+                # C00
+                # -------
+                prev_act = (x <= 0).detach().float()
+                curr_act = (y <= 0).detach().float()
+
+                # Cumulate outer product over all samples.
+                for s in range(n_samples):
+                    self.coacts_00[:] += torch.ger(curr_act[s], prev_act[s])
+
         # Return coactivations.
         return outer
+
+    def reset_coactivations(self):
+        super().reset_coactivations()
+        if self.track_coactivation_variants:
+            self.coacts_01[:] = 0
+            self.coacts_10[:] = 0
+            self.coacts_00[:] = 0
 
 
 # ------------------
@@ -406,10 +451,16 @@ class DSConv2d(torch.nn.Conv2d, DynamicSparseBase):
             half_precision=False,
             coactivation_test="correlation_proxy",
             threshold_multiplier=1,
+            track_coactivation_variants=False,
         )
         new_defaults = {k: (config.get(k, None) or v) for k, v in defaults.items()}
         self.__dict__.update(new_defaults)
         self.update_interval = self.conv_update_interval
+
+        if self.track_coactivation_variants:
+            self.register_buffer("coacts_01", torch.zeros_like(weight))
+            self.register_buffer("coacts_10", torch.zeros_like(weight))
+            self.register_buffer("coacts_00", torch.zeros_like(weight))
 
     def _get_single_unit_weights(self, c, j, h):
         """
@@ -450,94 +501,141 @@ class DSConv2d(torch.nn.Conv2d, DynamicSparseBase):
             2. (unit_in  - mean_input ) > input_activity_threshold
             3. (unit_out - mean_output) > output_activity_threshold
         """
-        with torch.no_grad():
+        print('DSConv2d.calc_coactivations')
+        print('    input_tensor', input_tensor.shape, input_tensor.device)
+        print('    weight', self.weight.shape, self.weight.device)
+        print('    nullconv', self.grouped_conv.weight.shape, self.grouped_conv.weight.device)
+        print()
 
-            # Switch to half-floating precision if needed.
-            if self.half_precision:
-                input_tensor = input_tensor.half()
+        micro_batch = 16
+        num_batches = input_tensor.shape[0]
+        input_tensor_copy = input_tensor
+        output_tensor_copy = output_tensor
+        new_coacts = torch.zeros_like(self.coactivations)
 
-            # Prep input to compute the coactivations.
-            grouped_input = input_tensor.repeat((1, self.new_groups, 1, 1))
-            grouped_input = self.grouped_conv(grouped_input).repeat(
-                (1, self.out_channels, 1, 1)
-            )
+        idx1 = 0
+        while idx1 < num_batches:
+            print('    computing for micro batch ', idx1)
+            idx2 = min(idx1 + micro_batch, num_batches)
+            input_tensor = input_tensor_copy[idx1:idx2, ...]
+            output_tensor = output_tensor_copy[idx1:idx2, ...]
 
-            mu_in = input_tensor.mean()
-            mu_out = output_tensor.mean()
-            std_in = input_tensor.std()
-            std_out = output_tensor.std()
+            with torch.no_grad():
 
-            if self.coactivation_test == "variance":
+                # Switch to half-floating precision if needed.
+                if self.half_precision:
+                    input_tensor = input_tensor.half()
 
-                a1, a2 = self.get_activity_threshold(input_tensor, output_tensor)
-                a1 = a1 * self.threshold_multiplier
-                a2 = a2 * self.threshold_multiplier
-                s1 = torch.abs(grouped_input - mu_in)
-                s1 = s1.gt_(a1)
-                s2 = torch.abs(output_tensor - mu_out)
-                s2 = s2.gt_(a2)[:, self.perm_indices, ...]
+                # Prep input to compute the coactivations.
+                grouped_input = input_tensor.repeat((1, self.new_groups, 1, 1))
+                grouped_input = self.grouped_conv(grouped_input).repeat(
+                    (1, self.out_channels, 1, 1)
+                )
 
-                # Save space on device
-                del mu_in
-                del mu_out
-                del a1
-                del a2
-                del grouped_input
+                mu_in = input_tensor.mean()
+                mu_out = output_tensor.mean()
+                std_in = input_tensor.std()
+                std_out = output_tensor.std()
 
-                h = torch.sum(s2.mul(s1), (0, 2, 3))
+                if self.coactivation_test == "variance":
 
-                del s1
-                del s2
+                    a1, a2 = self.get_activity_threshold(input_tensor, output_tensor)
+                    a1 = a1 * self.threshold_multiplier
+                    a2 = a2 * self.threshold_multiplier
+                    s1 = torch.abs(grouped_input - mu_in)
+                    s1 = s1.gt_(a1)
+                    s2 = torch.abs(output_tensor - mu_out)
+                    s2 = s2.gt_(a2)[:, self.perm_indices, ...]
 
-            elif self.coactivation_test == "correlation":
+                    # Save space on device
+                    del mu_in
+                    del mu_out
+                    del a1
+                    del a2
+                    del grouped_input
 
-                s1 = grouped_input
-                s2 = output_tensor[:, self.perm_indices, ...]
+                    h = torch.sum(s2.mul(s1), (0, 2, 3))
 
-                mu_in = s1.mean(dim=0)
-                mu_out = s2.mean(dim=0)
+                    del s1
+                    del s2
 
-                std_in = s1.std(dim=0)
-                std_out = s2.std(dim=0)
+                elif self.coactivation_test == "correlation":
 
-                corr = ((s1 - mu_in) * (s2 - mu_out)).mean(dim=0) / (std_in * std_out)
-                corr[torch.where((std_in == 0) | (std_out == 0))] = 0
-                corr = corr.abs()
+                    s1 = grouped_input
+                    s2 = output_tensor[:, self.perm_indices, ...]
 
-                # Save space on device
-                del s1
-                del s2
-                del grouped_input
-                del mu_in
-                del mu_out
-                del std_in
-                del std_out
+                    mu_in = s1.mean(dim=0)
+                    mu_out = s2.mean(dim=0)
 
-                h = torch.sum(corr, (1, 2))
-                h = h.type(self.coactivations.dtype)
+                    std_in = s1.std(dim=0)
+                    std_out = s2.std(dim=0)
 
-                del corr
+                    corr = ((s1 - mu_in) * (s2 - mu_out)).mean(dim=0) / (std_in * std_out)
+                    corr[torch.where((std_in == 0) | (std_out == 0))] = 0
+                    corr = corr.abs()
 
-            elif self.coactivation_test == "correlation_proxy":
+                    # Save space on device
+                    del s1
+                    del s2
+                    del grouped_input
+                    del mu_in
+                    del mu_out
+                    del std_in
+                    del std_out
 
-                del mu_in
-                del mu_out
+                    h = torch.sum(corr, (1, 2))
+                    h = h.type(self.coactivations.dtype)
 
-                s1 = grouped_input
-                s2 = output_tensor[:, self.perm_indices, ...]
+                    del corr
 
-                corr_proxy = (s1 != 0) * (s2 != 0)
-                h = torch.sum(corr_proxy, (0, 2, 3))
-                h = h.type(self.coactivations.dtype)
+                elif self.coactivation_test == "correlation_proxy":
 
-                del corr_proxy
+                    del mu_in
+                    del mu_out
 
-            new_coacts = torch.zeros_like(self.coactivations)
-            new_coacts[self.connection_indxs] = h
+                    s1 = grouped_input
+                    s2 = output_tensor[:, self.perm_indices, ...]
 
-            del h
+                    corr_proxy = (s1 != 0) * (s2 != 0)
+                    h = torch.sum(corr_proxy, (0, 2, 3))
+                    h = h.type(self.coactivations.dtype)
 
-            return new_coacts
+                    del corr_proxy
+
+                    # ----------
+                    # Variants
+                    # ----------
+                    if self.track_coactivation_variants:
+
+                        coact_01 = (s1 <= 0) * (s2 > 0)
+                        coact_01 = torch.sum(coact_01, (0, 2, 3))
+                        coact_01 = coact_01.type(self.coacts_01.dtype)
+                        self.coacts_01[self.connection_indxs] += coact_01
+
+                        coact_10 = (s1 > 0) * (s2 <= 0)
+                        coact_10 = torch.sum(coact_10, (0, 2, 3))
+                        coact_10 = coact_10.type(self.coacts_10.dtype)
+                        self.coacts_10[self.connection_indxs] += coact_10
+
+                        coact_00 = (s1 <= 0) * (s2 <= 0)
+                        coact_00 = torch.sum(coact_00, (0, 2, 3))
+                        coact_00 = coact_00.type(self.coacts_00.dtype)
+                        self.coacts_00[self.connection_indxs] += coact_00
+
+                # new_coacts = torch.zeros_like(self.coactivations)
+                new_coacts[self.connection_indxs] += h
+
+                del h
+                idx1 += micro_batch
+
+        return new_coacts
+
+    def reset_coactivations(self):
+        super().reset_coactivations()
+        if self.track_coactivation_variants:
+            self.coacts_01[:] = 0
+            self.coacts_10[:] = 0
+            self.coacts_00[:] = 0
 
     def __call__(self, input_tensor, *args, **kwargs):
         output_tensor = super().__call__(input_tensor, *args, **kwargs)

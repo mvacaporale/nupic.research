@@ -29,10 +29,12 @@ from io import BytesIO
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import PIL.Image
 import seaborn as sns
-from ray.tune.logger import CSVLogger, JsonLogger, Logger, flatten_dict
+from ray.tune.logger import CSVLogger, JsonLogger, Logger
 from ray.tune.result import TIME_TOTAL_S, TIMESTEPS_TOTAL, TRAINING_ITERATION
+from ray.tune.util import flatten_dict
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ def to_tf_values(result, path, histo_bins=1000):
     values = []
     for attr, value in result.items():
         if value is not None:
-            if attr.startswith("scatter_"):
+            if attr.startswith("seaborn_"):
 
                 # Value should be a dict which may be unpacked to sns.scatterplot e.g.
                 #
@@ -70,12 +72,20 @@ def to_tf_values(result, path, histo_bins=1000):
 
                 # Plot scatter plot.
                 seaborn_config = value.pop("seaborn_config", {})
+                plot_type = value.pop("seaborn_plottype", "scatterplot")
+                plot_type = getattr(sns, plot_type)
                 sns.set(**seaborn_config)
-                ax = sns.scatterplot(**value)
+                ax = plot_type(**value)
+
+                if hasattr(ax, "axes") and isinstance(ax.axes, np.ndarray):
+                    for axes_ in ax.axes:
+                        for ax_ in axes_:
+                            ax_.set_xlim(0, 0.9)
+                            ax_.set_ylim(0, 0.9)
 
                 # Save to BytesIO stream.
                 stream = BytesIO()
-                canvas = ax.figure.canvas
+                canvas = ax.figure.canvas if hasattr(ax, "figure") else ax.fig.canvas
                 canvas.draw()
                 (w, h) = canvas.get_width_height()
                 pilimage = PIL.Image.frombytes("RGB", (w, h), canvas.tostring_rgb())

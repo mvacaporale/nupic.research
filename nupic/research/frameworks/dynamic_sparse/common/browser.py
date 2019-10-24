@@ -121,6 +121,8 @@ def load(experiment_path, performance_metrics=None, raw_metrics=None):
     dataframes = []
     for exp_state, exp_name in experiment_states:
         progress, params = _read_experiment(exp_state, experiment_path)
+        if not progress:
+            continue
         dataframes.append(_get_value(
             progress, params, exp_name, performance_metrics, raw_metrics=raw_metrics))
 
