@@ -93,6 +93,9 @@ def create_model(model_class, model_args, init_batch_norm, device,
             state_dict = OrderedDict(
                 zip(model.state_dict().keys(), state_dict.values()))
 
+        from nupic.research.frameworks.pytorch.restore_utils import resize_model_buffers
+        resize_model_buffers(model, state_dict)
+
         model.load_state_dict(state_dict)
 
     return model
